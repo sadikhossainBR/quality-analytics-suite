@@ -856,36 +856,54 @@ def cr_streak_alerts(zibber, other, end, start=None, f_client="ALL", f_designer=
     frames = []
     for x in (zibber, other):
         if x is not None and not x.empty:
-            frames.append(x[x["_date"] <= end][["_date", "_client_name", "_norm_des", "_norm_qc", "_norm_rsn"]].copy())
+            frames.append(x[x["_date"] <= end][["_date", "_client_name", "_norm_des", "_norm_qc", "_norm_rsn"]])
     if not frames:
         return []
     base = pd.concat(frames, ignore_index=True)
     days = sorted(base["_date"].dropna().unique())
-    if not days:
+    if len(days) < STREAK_DAYS:
+        return []
+
+    # Only keep rows within a reasonable lookback window before `start` so we don't scan 12,490+ historical rows on every click
+    win_start = start if start is not None else days[0]
+    lookback_start = win_start - pd.Timedelta(days=45)
+    recent_days = [d for d in days if d >= lookback_start]
+    if len(recent_days) < STREAK_DAYS:
+        return []
+    base = base[base["_date"] >= lookback_start]
+    if base.empty:
         return []
 
     records = []
-    for idx, r in base.iterrows():
-        rsn = str(r.get("_norm_rsn", "")).strip()
+    dates_arr = base["_date"].tolist()
+    clients_arr = base["_client_name"].fillna("").astype(str).str.strip().tolist()
+    des_arr = base["_norm_des"].fillna("").astype(str).tolist()
+    qc_arr = base["_norm_qc"].fillna("").astype(str).tolist()
+    rsn_arr = base["_norm_rsn"].fillna("").astype(str).str.strip().tolist()
+
+    for idx in range(len(base)):
+        rsn = rsn_arr[idx]
         if not rsn or rsn.lower() in ("nan", "none", "no reason"):
             rsn = "Client Rejection"
-        designers = _split_people(r.get("_norm_des", "")) or [""]
-        qcs = _split_people(r.get("_norm_qc", "")) or [""]
-        order_uid = f"{r['_date']:%Y-%m-%d}_{idx}"
-        cname = str(r.get("_client_name", "")).strip()
+        designers = _split_people(des_arr[idx]) or [""]
+        qcs = _split_people(qc_arr[idx]) or [""]
+        dt = dates_arr[idx]
+        order_uid = f"{dt:%Y-%m-%d}_{idx}"
+        cname = clients_arr[idx]
+        cname_low = cname.lower()
         for des in designers:
             for qc in qcs:
                 records.append({
-                    "date": r["_date"],
+                    "date": dt,
                     "order_uid": order_uid,
                     "client": cname,
-                    "client_base_key": cname.lower(),
+                    "client_base_key": cname_low,
                     "designer": des,
                     "qc": qc,
                     "issue": rsn,
                 })
     return _compute_streak_alerts(
-        records, days, start=start, end=end,
+        records, recent_days, start=start, end=end,
         f_client=f_client, f_designer=f_designer, f_qc=f_qc, f_reason=f_reason
     )
 
@@ -1224,44 +1242,47 @@ def build_cr_report_text(zibber, other, span):
 
 
 def extract_cr_orders(df, client_override=None):
+    if df is None or df.empty:
+        return []
     job_col = find_col(df, JOB_COL_ALIASES)
     corr_qc_col = find_col(df, CORRECTION_QC_ALIASES)
+    n = len(df)
+
+    jobs = df[job_col].fillna("").astype(str).str.strip().tolist() if job_col else [""] * n
+    dates = df["_date"].tolist() if "_date" in df.columns else [pd.NaT] * n
+    vols = pd.to_numeric(df["_vol"], errors="coerce").fillna(0).astype(int).tolist() if "_vol" in df.columns else [0] * n
+    clients = [client_override] * n if client_override else df["_client_name"].fillna("Unassigned client").astype(str).tolist()
+    reasons = df["_norm_rsn"].fillna("").astype(str).str.strip().tolist() if "_norm_rsn" in df.columns else [""] * n
+    dess = df["_norm_des"].fillna("").astype(str).str.strip().tolist() if "_norm_des" in df.columns else [""] * n
+    qcs = df["_norm_qc"].fillna("").astype(str).str.strip().tolist() if "_norm_qc" in df.columns else [""] * n
+    corr_qcs = df[corr_qc_col].fillna("").astype(str).str.strip().tolist() if corr_qc_col else [""] * n
+    delays = df["delay reason"].fillna("").astype(str).str.strip().tolist() if "delay reason" in df.columns else [""] * n
+    raw_rsns = df["reason"].fillna("").astype(str).str.upper().tolist() if "reason" in df.columns else [""] * n
+    raw_cqc = df["correction qc"].fillna("").astype(str).str.upper().tolist() if "correction qc" in df.columns else [""] * n
 
     orders = []
-    for _, r in df.iterrows():
-        job_val = r[job_col] if job_col and job_col in r else None
-        job_id = str(job_val).strip() if pd.notna(job_val) and str(job_val).strip() not in ["", "nan"] else "N/A"
-        raw_date = r.get("_date")
-        date_str = str(raw_date.date()) if pd.notna(raw_date) else ""
-        vol = int(r["_vol"])
-
-        client = client_override if client_override else r.get("_client_name", "Unassigned client")
-        reason = r.get("_norm_rsn") or "No reason"
-        des = r.get("_norm_des") or "Unassigned"
-        qc = r.get("_norm_qc") or "Unassigned"
-        corr_qc = str(r[corr_qc_col]).strip() if corr_qc_col and pd.notna(r[corr_qc_col]) and str(r[corr_qc_col]).strip() not in ["", "nan"] else ""
-
-        delay_r = (
-            str(r["delay reason"]).strip()
-            if "delay reason" in r and pd.notna(r["delay reason"]) and str(r["delay reason"]).strip().lower() not in ["", "nan", "delay reason", "none"]
-            else None
-        )
-        is_customer = (
-            "CUSTOMER" in str(r.get("reason", "")).upper()
-            or "CUSTOMER" in str(r.get("correction qc", "")).upper()
-            or "CUSTOMER" in reason.upper()
-        )
-
+    for i in range(n):
+        jv = jobs[i]
+        job_id = jv if jv and jv.lower() != "nan" else "N/A"
+        dt = dates[i]
+        date_str = str(dt.date()) if pd.notna(dt) else ""
+        rsn = reasons[i] if reasons[i] and reasons[i].lower() != "nan" else "No reason"
+        des = dess[i] if dess[i] and dess[i].lower() != "nan" else "Unassigned"
+        qc = qcs[i] if qcs[i] and qcs[i].lower() != "nan" else "Unassigned"
+        cqc = corr_qcs[i] if corr_qcs[i] and corr_qcs[i].lower() != "nan" else ""
+        dl = delays[i]
+        delay_r = dl if dl and dl.lower() not in ("nan", "delay reason", "none") else None
+        is_customer = ("CUSTOMER" in raw_rsns[i]) or ("CUSTOMER" in raw_cqc[i]) or ("CUSTOMER" in rsn.upper())
         orders.append({
             "source": "CR",
             "date": date_str,
-            "client": client,
+            "client": clients[i],
             "job_id": job_id,
-            "volume": vol,
-            "reason": reason,
+            "volume": vols[i],
+            "reason": rsn,
             "designer": des,
             "qc": qc,
-            "correction_qc": corr_qc,
+            "correction_qc": cqc,
             "delay": delay_r,
             "is_customer": is_customer,
         })
@@ -2357,30 +2378,58 @@ def serve():
         if end < start:
             return {"error": "End date cannot be before start date."}
         span = (start, end)
-        text = build_cr_report_text(zibber, other, span)
-        if text is None:
-            return {"empty": True, "error": f"No client rejections found on {span_label(span)}."}
 
         z = zibber[(zibber["_date"] >= start) & (zibber["_date"] <= end)]
         o = other[(other["_date"] >= start) & (other["_date"] <= end)]
-        all_rows = pd.concat([z, o], ignore_index=True)
-        orders_list = extract_cr_orders(all_rows)
-        clients = sorted(list(set(x["client"] for x in orders_list)))
+        if z.empty and o.empty:
+            return {"empty": True, "error": f"No client rejections found on {span_label(span)}."}
+
         f_client = body.get("client", "ALL")
         f_designer = body.get("designer", "ALL")
         f_qc = body.get("qc", "ALL")
         f_reason = body.get("reason", "ALL")
+
         alerts = cr_streak_alerts(
             zibber, other, end, start=start,
             f_client=f_client, f_designer=f_designer, f_qc=f_qc, f_reason=f_reason
         )
+
+        # Build summary text directly using the already-computed alerts (avoids running cr_streak_alerts twice!)
+        found = list(dict.fromkeys(o["_client_name"]))
+        clients_ordered = [c for c in FIXED_CLIENTS if c in found] + [c for c in found if c not in FIXED_CLIENTS]
+        date_str = f"{start:%d %b %Y}" if start == end else f"{start:%d %b %Y} to {end:%d %b %Y}"
+        lines = [f"Date: {date_str}"]
+        if len(z):
+            lines += ["", "Zibber Client reject jobs", ""] + cr_block_lines(z)
+        if clients_ordered:
+            lines += ["", "Rest of RE client-rejected jobs"]
+            for c in clients_ordered:
+                lines += ["", c] + cr_block_lines(o[o["_client_name"] == c])
+        if alerts:
+            lines += ["", f"3-DAY RECURRING REJECTION REMINDERS ({STREAK_DAYS}+ CONSECUTIVE DAYS)"]
+            grouped = {}
+            for a in alerts:
+                grouped.setdefault((a["dimension"], a["entity"]), []).append(a)
+            for (dim_lbl, ent), items in grouped.items():
+                lines.append(f"ACTION NEEDED - {dim_lbl} {ent}: mistakes {STREAK_DAYS}+ days in a row. Please decide what action to take.")
+                for a in items:
+                    lines.append(
+                        f"   - {a['issue']} ({a['days']} days, {a['orders']} orders, {a['since']} to {a['until']})"
+                        + (f" | {a['details']}" if a["details"] else "")
+                    )
+        text = "
+".join(lines)
+
+        orders_list = extract_cr_orders(z, client_override="Zibber Client") + extract_cr_orders(o)
+        clients = sorted(list(set(x["client"] for x in orders_list)))
+        unique_days = len(set(z["_date"].tolist() + o["_date"].tolist()))
 
         return {
             "text": text,
             "label": span_label(span),
             "filename": f"CR_Report_{start:%d%m%Y}.txt",
             "summary": {
-                "days": int(all_rows["_date"].nunique()),
+                "days": unique_days,
                 "clients": clients,
                 "orders_list": orders_list,
                 "streak_days": STREAK_DAYS,
