@@ -1142,14 +1142,14 @@ def prepare_cr(raw, is_zibber=False):
 
 
 def read_cr_book(source):
-    book = pd.read_excel(source, sheet_name=[CR_ZIBBER_SHEET, CR_OTHER_SHEET], header=None)
+    book = pd.read_excel(source, sheet_name=[CR_ZIBBER_SHEET, CR_OTHER_SHEET], header=None, engine="openpyxl")
     return prepare_cr(book[CR_ZIBBER_SHEET], is_zibber=True), prepare_cr(book[CR_OTHER_SHEET], is_zibber=False)
 
 
 def load_cr_online(url):
     import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=45) as r:
         raw = r.read()
     if not raw.startswith(b"PK"):
         raise RuntimeError("Google asked for sign-in on Client Rejection sheet.")
@@ -2113,76 +2113,97 @@ STATE = {
     "qa_df": None, "qa_source": "", "qa_error": None,
     "cr_zib": None, "cr_oth": None, "cr_source": "", "cr_error": None,
     "prod_df": None, "prod_source": "", "prod_error": None,
-    "loading": True,
+    "loading": True, "qa_loading": True, "cr_loading": True, "prod_loading": True,
 }
 HEARTBEAT = {"last": 0.0, "seen": False}
 
 
 def _load_all_state():
-    STATE.update(loading=True, qa_error=None, cr_error=None, prod_error=None)
+    from concurrent.futures import ThreadPoolExecutor
+
+    STATE.update(
+        loading=True,
+        qa_loading=True, cr_loading=True, prod_loading=True,
+        qa_error=None, cr_error=None, prod_error=None,
+    )
     folder = app_folder()
     xlsx_files = sorted((p for p in folder.glob("*.xlsx") if not p.name.startswith("~$")), key=lambda p: p.stat().st_mtime, reverse=True)
 
-    qa_df, qa_src = None, ""
-    if QA_ONLINE_URL:
-        try:
-            qa_df, qa_src = load_qa_online(QA_ONLINE_URL), "QA: Google Sheet"
-        except Exception as e:
-            STATE["qa_error"] = str(e)
-    if qa_df is None:
-        for f in xlsx_files:
+    def _load_qa():
+        qa_df, qa_src = None, ""
+        if QA_ONLINE_URL:
             try:
-                xl = pd.ExcelFile(f)
-                if QA_SHEET in xl.sheet_names:
-                    qa_df = prepare_qa(pd.read_excel(xl, sheet_name=QA_SHEET))
-                    qa_src = f"QA: {f.name}"
-                    STATE["qa_error"] = None
-                    break
-            except Exception:
-                pass
-    STATE["qa_df"] = qa_df
-    STATE["qa_source"] = qa_src or "QA: Not loaded"
+                qa_df, qa_src = load_qa_online(QA_ONLINE_URL), "QA: Google Sheet"
+            except Exception as e:
+                STATE["qa_error"] = str(e)
+        if qa_df is None:
+            for f in xlsx_files:
+                try:
+                    xl = pd.ExcelFile(f)
+                    if QA_SHEET in xl.sheet_names:
+                        qa_df = prepare_qa(pd.read_excel(xl, sheet_name=QA_SHEET))
+                        qa_src = f"QA: {f.name}"
+                        STATE["qa_error"] = None
+                        break
+                except Exception:
+                    pass
+        STATE["qa_df"] = qa_df
+        STATE["qa_source"] = qa_src or "QA: Not loaded"
+        STATE["qa_loading"] = False
 
-    cr_z, cr_o, cr_src = None, None, ""
-    if CR_ONLINE_URL:
-        try:
-            (cr_z, cr_o), cr_src = load_cr_online(CR_ONLINE_URL), "CR: Google Sheet"
-        except Exception as e:
-            STATE["cr_error"] = str(e)
-    if cr_z is None:
-        for f in xlsx_files:
+    def _load_cr():
+        cr_z, cr_o, cr_src = None, None, ""
+        if CR_ONLINE_URL:
             try:
-                xl = pd.ExcelFile(f)
-                if CR_ZIBBER_SHEET in xl.sheet_names and CR_OTHER_SHEET in xl.sheet_names:
-                    cr_z, cr_o = read_cr_book(f)
-                    cr_src = f"CR: {f.name}"
-                    STATE["cr_error"] = None
-                    break
-            except Exception:
-                pass
-    STATE["cr_zib"] = cr_z
-    STATE["cr_oth"] = cr_o
-    STATE["cr_source"] = cr_src or "CR: Not loaded"
+                (cr_z, cr_o), cr_src = load_cr_online(CR_ONLINE_URL), "CR: Google Sheet"
+            except Exception as e:
+                STATE["cr_error"] = str(e)
+        if cr_z is None:
+            for f in xlsx_files:
+                try:
+                    xl = pd.ExcelFile(f)
+                    if CR_ZIBBER_SHEET in xl.sheet_names and CR_OTHER_SHEET in xl.sheet_names:
+                        cr_z, cr_o = read_cr_book(f)
+                        cr_src = f"CR: {f.name}"
+                        STATE["cr_error"] = None
+                        break
+                except Exception:
+                    pass
+        STATE["cr_zib"] = cr_z
+        STATE["cr_oth"] = cr_o
+        STATE["cr_source"] = cr_src or "CR: Not loaded"
+        STATE["cr_loading"] = False
 
-    prod_df, prod_src = None, ""
-    if PROD_ONLINE_URL:
-        try:
-            prod_df, prod_src = load_prod_online(PROD_ONLINE_URL), "Prod: Google Sheet"
-        except Exception as e:
-            STATE["prod_error"] = str(e)
-    if prod_df is None:
-        for f in xlsx_files:
+    def _load_prod():
+        prod_df, prod_src = None, ""
+        if PROD_ONLINE_URL:
             try:
-                xl = pd.ExcelFile(f)
-                if PROD_SHEET in xl.sheet_names:
-                    prod_df = prepare_prod(pd.read_excel(xl, sheet_name=PROD_SHEET))
-                    prod_src = f"Prod: {f.name}"
-                    STATE["prod_error"] = None
-                    break
+                prod_df, prod_src = load_prod_online(PROD_ONLINE_URL), "Prod: Google Sheet"
+            except Exception as e:
+                STATE["prod_error"] = str(e)
+        if prod_df is None:
+            for f in xlsx_files:
+                try:
+                    xl = pd.ExcelFile(f)
+                    if PROD_SHEET in xl.sheet_names:
+                        prod_df = prepare_prod(pd.read_excel(xl, sheet_name=PROD_SHEET))
+                        prod_src = f"Prod: {f.name}"
+                        STATE["prod_error"] = None
+                        break
+                except Exception:
+                    pass
+        STATE["prod_df"] = prod_df
+        STATE["prod_source"] = prod_src or "Prod: Not loaded"
+        STATE["prod_loading"] = False
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(_load_qa), pool.submit(_load_cr), pool.submit(_load_prod)]
+        for fut in futures:
+            try:
+                fut.result()
             except Exception:
                 pass
-    STATE["prod_df"] = prod_df
-    STATE["prod_source"] = prod_src or "Prod: Not loaded"
+
     STATE["loading"] = False
 
 
@@ -2197,7 +2218,7 @@ def serve():
         prod_df = STATE["prod_df"]
         today = pd.Timestamp.today().normalize()
         out = {
-            "loading": STATE["loading"],
+            "loading": STATE["loading"], "qa_loading": STATE.get("qa_loading", False), "cr_loading": STATE.get("cr_loading", False), "prod_loading": STATE.get("prod_loading", False),
             "qa_loaded": qa_df is not None,
             "qa_source": STATE["qa_source"],
             "qa_rows": len(qa_df) if qa_df is not None else 0,
@@ -3741,18 +3762,54 @@ function switchTab(tab){
 }
 
 // ==================== INIT ====================
+let _qaAutoRan=false, _crAutoRan=false, _prodAutoRan=false;
 async function init(){
   ST=await api("/api/status");
-  if(ST.loading){
-    $("#qaResult").innerHTML='<div class="card loading" style="margin-top:16px"><div class="spin"></div>Loading QA, Client Rejection &amp; Productivity spreadsheets…</div>';
-    setTimeout(init,900); return;
+  $("#dotQa").className=ST.qa_loading?"dot off":(ST.qa_loaded?"dot":"dot err");
+  $("#srcQa").textContent=ST.qa_loading?"Loading QA…":(ST.qa_source+(ST.qa_loaded?` (${nf(ST.qa_rows)})`:""));
+  $("#dotCr").className=ST.cr_loading?"dot off":(ST.cr_loaded?"dot":"dot err");
+  $("#srcCr").textContent=ST.cr_loading?"Loading CR…":(ST.cr_source+(ST.cr_loaded?` (${nf(ST.cr_rows)})`:""));
+  $("#dotProd").className=ST.prod_loading?"dot off":(ST.prod_loaded?"dot":"dot err");
+  $("#srcProd").textContent=ST.prod_loading?"Loading Prod…":(ST.prod_source+(ST.prod_loaded?` (${nf(ST.prod_rows)})`:""));
+
+  if(!ST.qa_loading && ST.qa_loaded && !_qaAutoRan){
+    _qaAutoRan=true;
+    if(ST.auditors && ST.auditors.length){
+      const cur=$("#qaAud").value;
+      $("#qaAud").innerHTML=ST.auditors.map(a=>`<option value="${esc(a.name)}">${esc(a.name)}</option>`).join("");
+      $("#qaAud").value=cur||ST.default_auditor;
+      if($("#compAud")){
+        const curCompA=$("#compAud").value||"ALL";
+        $("#compAud").innerHTML='<option value="ALL">All Auditors</option>' + ST.auditors.map(a=>`<option value="${esc(a.name)}">${esc(a.name.toUpperCase())}</option>`).join("");
+        $("#compAud").value=curCompA;
+      }
+    }
+    if(!$("#qaFrom").value){
+      const meta=(ST.auditors||[]).find(x=>x.name===$("#qaAud").value);
+      $("#qaFrom").value=(meta&&meta.latest)||iso(new Date());
+      runQaReport();
+    }
+  } else if(ST.qa_loading && !$("#qaResult").innerHTML){
+    $("#qaResult").innerHTML='<div class="card loading" style="margin-top:16px"><div class="spin"></div>Downloading QA, Client Rejection &amp; Productivity sheets in parallel…</div>';
   }
-  $("#dotQa").className=ST.qa_loaded?"dot":"dot err";
-  $("#srcQa").textContent=ST.qa_source+(ST.qa_loaded?` (${nf(ST.qa_rows)})`:"");
-  $("#dotCr").className=ST.cr_loaded?"dot":"dot err";
-  $("#srcCr").textContent=ST.cr_source+(ST.cr_loaded?` (${nf(ST.cr_rows)})`:"");
-  $("#dotProd").className=ST.prod_loaded?"dot":"dot err";
-  $("#srcProd").textContent=ST.prod_source+(ST.prod_loaded?` (${nf(ST.prod_rows)})`:"");
+
+  if(!ST.cr_loading && ST.cr_loaded && !_crAutoRan){
+    _crAutoRan=true;
+    if(!$("#crFrom").value) $("#crFrom").value=ST.cr_latest||iso(new Date());
+    if(ACTIVE_TAB==="CR") runCrReport();
+  }
+
+  if(!ST.prod_loading && ST.prod_loaded && !_prodAutoRan){
+    _prodAutoRan=true;
+    if(!$("#grpFrom").value) $("#grpFrom").value=ST.prod_latest||iso(new Date());
+    if(!$("#specFrom").value) $("#specFrom").value=ST.prod_latest||iso(new Date());
+    if(ACTIVE_TAB==="GROUP") runGroupData(true);
+    if(ACTIVE_TAB==="SPEC") runSpecwiseData(true);
+  }
+
+  if(ST.loading){
+    setTimeout(init,800); return;
+  }
 
   if(ST.auditors && ST.auditors.length){
     const cur=$("#qaAud").value;
@@ -5074,7 +5131,7 @@ $("#qaAud").onchange=()=>{
 };
 $("#reload").onclick=async()=>{
   toast("Reloading all sheets…");
-  CUR_QA=CUR_CR=CUR_ATTN=CUR_CHARTS=CUR_COMP=CUR_GROUP=CUR_SPEC=null;
+  CUR_QA=CUR_CR=CUR_ATTN=CUR_CHARTS=CUR_COMP=CUR_GROUP=CUR_SPEC=null;_qaAutoRan=_crAutoRan=_prodAutoRan=false;
   await api("/api/reload",{});
   setTimeout(init,800);
 };
