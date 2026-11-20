@@ -2417,8 +2417,7 @@ def serve():
                         f"   - {a['issue']} ({a['days']} days, {a['orders']} orders, {a['since']} to {a['until']})"
                         + (f" | {a['details']}" if a["details"] else "")
                     )
-        text = "
-".join(lines)
+        text = "\n".join(lines)
 
         orders_list = extract_cr_orders(z, client_override="Zibber Client") + extract_cr_orders(o)
         clients = sorted(list(set(x["client"] for x in orders_list)))
